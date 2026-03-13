@@ -7,7 +7,7 @@
 
 ## Project Overview
 
-A Python CLI tool that takes a folder of photos and produces a single **PDF collage** with a fixed physical width of **60 cm** and auto-calculated height. The aesthetic is deliberately "playful": images are slightly rotated, have white borders, and rounded corners. Layout is greedy row-packing with even horizontal distribution.
+A Python CLI tool that takes a folder of photos and produces a single **PDF collage** with a fixed physical width of **60 cm** and auto-calculated height. The aesthetic is deliberately "playful": images are slightly rotated, have optional white borders, and rounded corners. All tuneable parameters live in `collage.ini` — the script contains no magic numbers.
 
 ---
 
@@ -16,6 +16,7 @@ A Python CLI tool that takes a folder of photos and produces a single **PDF coll
 ```
 project/
 ├── collage_generator.py   # Main script — single-file, no package structure
+├── collage.ini            # All tuneable parameters (INI format)
 └── CLAUDE.md              # ← this file
 ```
 
@@ -33,18 +34,21 @@ Install:
 pip install Pillow reportlab
 ```
 
-Python version: **3.10+** (uses `list[...]` type hints without `from __future__`)
+Python version: **3.10+**
 
 ---
 
 ## Usage
 
 ```bash
-# Basic
+# Basic (reads collage.ini from script directory automatically)
 python collage_generator.py ./photos output.pdf
 
-# With options
-python collage_generator.py ./photos output.pdf --seed 42 --dpi 300
+# Custom config file
+python collage_generator.py ./photos output.pdf --config /path/to/custom.ini
+
+# Reproducible layout
+python collage_generator.py ./photos output.pdf --seed 42
 ```
 
 ### CLI Arguments
@@ -53,68 +57,85 @@ python collage_generator.py ./photos output.pdf --seed 42 --dpi 300
 |---|---|---|---|
 | `folder` | positional | required | Path to source image folder |
 | `output` | positional | `collage.pdf` | Output PDF path |
+| `--config` | Path | `./collage.ini` | INI config file path |
 | `--seed` | int | `None` | RNG seed for reproducible layout |
-| `--dpi` | int | `150` | Render resolution (use 300 for print) |
+
+---
+
+## collage.ini Reference
+
+All tuneable parameters. The script reads this file at startup.
+
+```ini
+[canvas]
+width_cm = 60.0                 # Physical paper width in cm (height is auto)
+dpi = 150                       # 150=preview, 300=print quality
+background_color = 255,255,255  # R,G,B — ignored if transparent_background=true
+transparent_background = false  # true → RGBA canvas, mask="auto" in PDF
+
+[layout]
+row_target_height = 0.13        # Image height as fraction of canvas width
+min_images_per_row = 7          # Minimum images forced into each row
+max_images_per_row = 8          # Maximum images per row
+padding_px = 4                  # Horizontal gap between images (px at DPI)
+row_gap_px = 2                  # Vertical gap between rows (px at DPI)
+
+[decoration]
+border_px = 0                   # White border per image; 0 = disabled
+corner_radius_px = 10           # Rounded corner radius; 0 = sharp corners
+rotation_max_deg = 8            # Max ±random rotation per image; 0 = no rotation
+```
 
 ---
 
 ## Architecture
 
-### Pipeline (sequential, no concurrency)
+### Pipeline
 
 ```
-load_images()
-    └── Open all images from folder (jpg, jpeg, png, webp, bmp, tiff)
-    └── Resize each to ROW_TARGET_HEIGHT (fraction of canvas width)
-    └── add_border() → white Pillow border
-    └── round_corners() → RGBA alpha-mask technique
+load_config(ini_path)
+    └── configparser → Config dataclass (validated)
 
-arrange_rows()
-    └── Greedy left-to-right bin packing
-    └── New row when next image would exceed canvas width
+load_images(folder, cfg, canvas_width_px)
+    └── Discover images (jpg, jpeg, png, webp, bmp, tiff)
+    └── Resize each → row_target_height (proportional)
+    └── add_border()     — conditional on border_px > 0
+    └── round_corners()  — conditional on corner_radius_px > 0
 
-build_canvas()
-    └── Two passes: first computes total height, second composites
-    └── Random rotation per image (±ROTATION_MAX_DEG)
-    └── Vertical centering per row
-    └── RGBA paste with alpha mask for rounded corners
+arrange_rows(images, canvas_width_px, cfg)
+    └── Chunk into groups of ~target_n (between min and max per row)
+    └── Uniform-scale each chunk so total width == canvas_width_px
 
-save_pdf()
-    └── Computes PDF page size in points from cm
-    └── Saves temp PNG → drawImage via reportlab → removes temp file
+build_canvas(rows, canvas_width_px, cfg, rng)
+    └── Pass 1: pre-rotate all images, accumulate total height
+    └── Pass 2: composite with equal inter-image spacing
+    └── RGBA paste respects alpha mask from round_corners
+
+save_pdf(collage, output_path, cfg)
+    └── reportlab Canvas at physical dimensions (cm → points)
+    └── tmp PNG → drawImage → remove tmp
+    └── mask="auto" when transparent_background=true
 ```
+
+### Key Types
+
+| Name | Type | Purpose |
+|---|---|---|
+| `Config` | `@dataclass` | Single source of truth for all runtime parameters |
+| `DEFAULT_INI` | `Path` | Resolved relative to `__file__` so script is location-independent |
 
 ### Key Functions
 
-| Function | Signature | Purpose |
-|---|---|---|
-| `px(cm_val, dpi)` | `(float, int) → int` | Unit conversion cm → pixels |
-| `add_border(img, border)` | `(Image, int) → Image` | White border via `ImageOps.expand` |
-| `round_corners(img, radius)` | `(Image, int) → Image` | Alpha mask rounded rectangle |
-| `rotate_image(img, angle)` | `(Image, float) → Image` | Expand-rotate (not used directly; inlined in `build_canvas`) |
-| `load_images(folder, dpi, canvas_width_px)` | `(Path, int, int) → list[Image]` | Full load + decorate pipeline |
-| `arrange_rows(images, canvas_width_px, padding)` | `(list[Image], int, int) → list[list[Image]]` | Row packing |
-| `build_canvas(rows, canvas_width_px, padding, rng)` | `(...) → Image` | Composite final image |
-| `save_pdf(collage, output_path, dpi, canvas_width_cm)` | `(Image, Path, int, float) → None` | Export to PDF |
-
----
-
-## Layout Constants (top of `collage_generator.py`)
-
-All tuneable parameters are module-level constants:
-
-```python
-CANVAS_WIDTH_CM   = 60.0          # Physical paper width — do not change lightly
-DPI_DEFAULT       = 150           # 150 = screen/preview, 300 = print
-PADDING_PX        = 20            # Gap between images (at DPI)
-BORDER_PX         = 8             # White photo border thickness
-CORNER_RADIUS_PX  = 24            # Rounded corner radius
-ROTATION_MAX_DEG  = 12            # Max ±random rotation per image
-ROW_TARGET_HEIGHT = 0.22          # Images scaled to this fraction of canvas width
-MIN_IMAGES_PER_ROW = 1            # (reserved, not enforced in current packing)
-MAX_IMAGES_PER_ROW = 5            # (reserved, not enforced in current packing)
-BACKGROUND_COLOR  = (245, 242, 235)  # Warm off-white canvas fill
-```
+| Function | Purpose |
+|---|---|
+| `load_config(ini_path)` | Parse and validate collage.ini → `Config` |
+| `px(cm_val, dpi)` | Unit conversion cm → pixels |
+| `add_border(img, border)` | No-op when `border <= 0` |
+| `round_corners(img, radius)` | No-op when `radius <= 0`; uses RGBA alpha mask |
+| `load_images(folder, cfg, canvas_width_px)` | Full load + decorate pipeline |
+| `arrange_rows(images, canvas_width_px, cfg)` | Chunk + uniform-scale to enforce min/max per row |
+| `build_canvas(rows, canvas_width_px, cfg, rng)` | Two-pass composite with random rotation |
+| `save_pdf(collage, output_path, cfg)` | reportlab PDF export |
 
 ---
 
@@ -122,23 +143,23 @@ BACKGROUND_COLOR  = (245, 242, 235)  # Warm off-white canvas fill
 
 | # | Area | Issue | Suggested Fix |
 |---|---|---|---|
-| 1 | Layout | `MIN/MAX_IMAGES_PER_ROW` constants are defined but not enforced | Wire into `arrange_rows()` |
-| 2 | Layout | Last row may be sparse (few images, lots of whitespace) | Scale up last-row images to fill width |
-| 3 | Performance | All images decoded at full DPI before layout | Decode at thumbnail first, re-decode full-res after layout |
-| 4 | PDF | Uses a temp `.tmp.png` file on disk | Use `io.BytesIO` to keep everything in-memory |
-| 5 | Rotation | `rotate_image()` is defined but not called directly (logic inlined in `build_canvas`) | Either remove the standalone function or refactor to call it |
-| 6 | Variety | All images scaled to the same row height | Add ±10% random height variation per image for more organic feel |
-| 7 | CLI | No `--width` flag; canvas width is hardcoded as a constant | Expose `CANVAS_WIDTH_CM` as a CLI argument |
+| 1 | Layout | Last row may have fewer images than min_images_per_row (tail absorption) | Accept as intentional; or scale last row to match |
+| 2 | Performance | All images decoded at full DPI before layout | Decode thumbnail first, re-decode at full res post-layout |
+| 3 | PDF | Uses a temp `.tmp.png` on disk | Use `io.BytesIO` to keep in-memory |
+| 4 | Variety | All images in a row scaled to the same height | Add ±N% random height jitter per image for more organic feel |
+| 5 | CLI | `--dpi` removed (now in INI) | Consider re-exposing as CLI override that trumps INI |
+| 6 | Config | No validation ranges (e.g. negative radius silently accepted as no-op) | Add range checks in `load_config()` |
 
 ---
 
 ## Design Decisions
 
-- **Single-file script** — no package structure, intentional for portability and simplicity.
-- **Pillow over OpenCV** — sufficient for 2D compositing; no CV operations needed.
-- **reportlab for PDF** — direct physical-unit control (cm → points) without Cairo/wkhtmltopdf deps.
-- **Greedy packing over bin-packing solver** — fast, deterministic given a seed, good-enough aesthetics.
-- **RGBA throughout decoration pipeline** — border → round_corners → rotate all preserve alpha; flattened to RGB only at canvas composite time.
+- **INI over env vars / CLI flags** — parameters are project-level config, not per-run overrides. Keeps the command line clean.
+- **`Config` dataclass** — single validated object passed through the entire pipeline; no global state.
+- **`DEFAULT_INI = Path(__file__).with_name("collage.ini")`** — script resolves its config relative to itself, so it works regardless of cwd.
+- **Uniform row scaling** — enforcing min/max images per row by scaling (rather than reflowing) guarantees tight, justified rows without complex bin-packing.
+- **`border_px = 0` / `corner_radius_px = 0` as disabling sentinel** — avoids boolean flags; functions are no-ops at zero.
+- **`transparent_background`** — preserved through the entire pipeline (RGBA canvas, `mask="auto"` in reportlab) for clean compositing in layout tools.
 
 ---
 
@@ -147,6 +168,7 @@ BACKGROUND_COLOR  = (245, 242, 235)  # Warm off-white canvas fill
 | Date | Change |
 |---|---|
 | 2026-03-13 | Initial version — 60cm PDF, greedy row layout, rotation, rounded corners, white border |
+| 2026-03-13 | Extracted all tuneable params to `collage.ini`; added `Config` dataclass; enforced min/max per row via uniform scaling; added `row_gap_px`, `transparent_background`; defaults: pure white bg, no border, 7–8 imgs/row, 10px corners, ±8° rotation |
 
 ---
 

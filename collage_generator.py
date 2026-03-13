@@ -3,48 +3,110 @@
 collage_generator.py
 Generates a playful photo collage PDF from a folder of images.
 
+All tuneable parameters are read from collage.ini (same directory as this
+script, or pass --config to override).
+
 Usage:
-    python collage_generator.py <input_folder> [output.pdf] [--seed 42] [--dpi 150]
+    python collage_generator.py <input_folder> [output.pdf] [--config collage.ini] [--seed 42]
 
 Requirements:
     pip install Pillow reportlab
 """
 
 import argparse
-import math
-import os
+import configparser
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageOps
 from reportlab.lib.units import cm
 from reportlab.pdfgen import canvas as rl_canvas
 
-# ── Layout constants ──────────────────────────────────────────────────────────
-CANVAS_WIDTH_CM   = 60.0          # fixed paper width
-DPI_DEFAULT       = 150           # render resolution (increase for print quality)
-PADDING_PX        = 20            # gap between images (pixels at chosen DPI)
-BORDER_PX         = 8             # white border around each photo
-CORNER_RADIUS_PX  = 24            # rounded corner radius
-ROTATION_MAX_DEG  = 12            # max ±rotation per image
-ROW_TARGET_HEIGHT = 0.22          # target row height as fraction of canvas width
-MIN_IMAGES_PER_ROW = 1
-MAX_IMAGES_PER_ROW = 5
-BACKGROUND_COLOR  = (245, 242, 235)  # warm off-white
 
+# ── Config dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class Config:
+    # [canvas]
+    width_cm: float
+    dpi: int
+    background_color: tuple   # None = transparent
+    transparent_background: bool
+
+    # [layout]
+    row_target_height: float
+    min_images_per_row: int
+    max_images_per_row: int
+    padding_px: int
+    row_gap_px: int
+
+    # [decoration]
+    border_px: int
+    corner_radius_px: int
+    rotation_max_deg: float
+
+
+DEFAULT_INI = Path(__file__).with_name("collage.ini")
+
+
+def load_config(ini_path: Path) -> Config:
+    """Parse collage.ini and return a validated Config object."""
+    if not ini_path.exists():
+        sys.exit(f"Config file not found: {ini_path}\n"
+                 f"Create it or pass --config <path>.")
+
+    p = configparser.ConfigParser()
+    p.read(ini_path)
+
+    def _color(raw: str):
+        parts = [int(x.strip()) for x in raw.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Expected R,G,B — got: {raw!r}")
+        return tuple(parts)
+
+    canvas  = p["canvas"]
+    layout  = p["layout"]
+    deco    = p["decoration"]
+
+    transparent = canvas.getboolean("transparent_background", fallback=False)
+
+    return Config(
+        width_cm               = canvas.getfloat("width_cm"),
+        dpi                    = canvas.getint("dpi"),
+        background_color       = None if transparent else _color(canvas["background_color"]),
+        transparent_background = transparent,
+        row_target_height      = layout.getfloat("row_target_height"),
+        min_images_per_row     = layout.getint("min_images_per_row"),
+        max_images_per_row     = layout.getint("max_images_per_row"),
+        padding_px             = layout.getint("padding_px"),
+        row_gap_px             = layout.getint("row_gap_px"),
+        border_px              = deco.getint("border_px"),
+        corner_radius_px       = deco.getint("corner_radius_px"),
+        rotation_max_deg       = deco.getfloat("rotation_max_deg"),
+    )
+
+
+# ── Unit helpers ──────────────────────────────────────────────────────────────
 
 def px(cm_val: float, dpi: int) -> int:
-    """Convert cm → pixels."""
+    """Convert cm → pixels at the given DPI."""
     return int(cm_val / 2.54 * dpi)
 
 
+# ── Image decoration ──────────────────────────────────────────────────────────
+
 def add_border(img: Image.Image, border: int) -> Image.Image:
+    if border <= 0:
+        return img
     return ImageOps.expand(img, border=border, fill=(255, 255, 255))
 
 
 def round_corners(img: Image.Image, radius: int) -> Image.Image:
-    """Apply rounded corners via alpha mask (works on RGBA)."""
+    """Apply rounded corners via RGBA alpha mask."""
+    if radius <= 0:
+        return img
     img = img.convert("RGBA")
     w, h = img.size
     mask = Image.new("L", (w, h), 0)
@@ -54,160 +116,177 @@ def round_corners(img: Image.Image, radius: int) -> Image.Image:
     return img
 
 
-def rotate_image(img: Image.Image, angle: float) -> Image.Image:
-    """Rotate with expand so corners aren't clipped; background transparent."""
-    return img.rotate(angle, expand=True, resample=Image.BICUBIC)
+# ── Loading ───────────────────────────────────────────────────────────────────
 
-
-def load_images(folder: Path, dpi: int, canvas_width_px: int) -> list[Image.Image]:
-    """Load, resize, decorate all images from folder."""
+def load_images(folder: Path, cfg: Config, canvas_width_px: int) -> list:
+    """Load all images, resize to row target height, apply decoration."""
     exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
     paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in exts)
     if not paths:
         sys.exit(f"No images found in {folder}")
 
-    target_h = int(canvas_width_px * ROW_TARGET_HEIGHT)
+    target_h = max(1, int(canvas_width_px * cfg.row_target_height))
     processed = []
+
     for p in paths:
         img = Image.open(p).convert("RGB")
-        # Scale so height = target_h (width scales proportionally)
         ratio = target_h / img.height
         new_w = max(1, int(img.width * ratio))
         img = img.resize((new_w, target_h), Image.LANCZOS)
-        img = add_border(img, BORDER_PX)
-        img = round_corners(img, CORNER_RADIUS_PX)
+        img = add_border(img, cfg.border_px)
+        img = round_corners(img, cfg.corner_radius_px)
         processed.append(img)
 
     return processed
 
 
-def arrange_rows(images: list[Image.Image], canvas_width_px: int, padding: int
-                 ) -> list[list[Image.Image]]:
-    """
-    Greedy row packing: fill rows left-to-right until adding the next image
-    would exceed canvas width (accounting for padding). Shuffle within rows
-    for variety while keeping all images.
-    """
-    rows: list[list[Image.Image]] = []
-    current_row: list[Image.Image] = []
-    current_w = 0
+# ── Layout ────────────────────────────────────────────────────────────────────
 
-    for img in images:
-        w = img.width
-        extra_pad = padding if current_row else 0
-        if current_w + extra_pad + w > canvas_width_px and current_row:
-            rows.append(current_row)
-            current_row = [img]
-            current_w = w
-        else:
-            current_row.append(img)
-            current_w += extra_pad + w
+def arrange_rows(images: list, canvas_width_px: int, cfg: Config) -> list:
+    """
+    Chunk images into rows of size in [min, max], then scale each row
+    uniformly so its total width fills canvas_width_px exactly.
+    """
+    pad      = cfg.padding_px
+    target_n = (cfg.min_images_per_row + cfg.max_images_per_row) // 2
+    rows     = []
+    i, n     = 0, len(images)
 
-    if current_row:
-        rows.append(current_row)
+    while i < n:
+        remaining  = n - i
+        chunk_size = min(target_n, cfg.max_images_per_row)
+        # Absorb a too-small tail into this row
+        if remaining - chunk_size < cfg.min_images_per_row:
+            chunk_size = remaining
+
+        chunk = images[i : i + chunk_size]
+        i    += chunk_size
+
+        # Uniform scale so the row fills the full canvas width
+        total_pad = pad * (len(chunk) - 1)
+        natural_w = sum(img.width for img in chunk)
+        scale     = (canvas_width_px - total_pad) / natural_w if natural_w else 1.0
+
+        scaled = []
+        for img in chunk:
+            new_w = max(1, int(img.width  * scale))
+            new_h = max(1, int(img.height * scale))
+            scaled.append(img.resize((new_w, new_h), Image.LANCZOS))
+
+        rows.append(scaled)
 
     return rows
 
 
-def build_canvas(rows: list[list[Image.Image]],
-                 canvas_width_px: int,
-                 padding: int,
-                 rng: random.Random) -> Image.Image:
-    """Composite all rows onto a single tall canvas with random rotations."""
+# ── Compositing ───────────────────────────────────────────────────────────────
 
-    # First pass: compute total canvas height
-    total_height = padding  # top margin
-    row_heights = []
+def build_canvas(rows: list, canvas_width_px: int, cfg: Config, rng: random.Random) -> Image.Image:
+    """Composite all rows onto a single tall canvas with random per-image rotation."""
+
+    mode = "RGBA" if cfg.transparent_background else "RGB"
+    bg   = (0, 0, 0, 0) if cfg.transparent_background else cfg.background_color
+    pad  = cfg.padding_px
+    gap  = cfg.row_gap_px
+
+    # Pass 1 — pre-rotate and measure total height
+    pre      = []
+    total_h  = gap  # top margin
+
     for row in rows:
-        # After rotation each image bounding box may be taller
-        angles = [rng.uniform(-ROTATION_MAX_DEG, ROTATION_MAX_DEG) for _ in row]
+        angles  = [rng.uniform(-cfg.rotation_max_deg, cfg.rotation_max_deg) for _ in row]
         rotated = [img.rotate(a, expand=True, resample=Image.BICUBIC)
                    for img, a in zip(row, angles)]
-        row_h = max(r.height for r in rotated) + padding
-        row_heights.append((row_h, angles, rotated))
-        total_height += row_h
+        row_h   = max(r.height for r in rotated)
+        pre.append((rotated, angles))
+        total_h += row_h + gap
 
-    total_height += padding  # bottom margin
+    # Pass 2 — composite
+    canvas = Image.new(mode, (canvas_width_px, total_h), bg)
 
-    canvas = Image.new("RGB", (canvas_width_px, total_height), BACKGROUND_COLOR)
+    y = gap
+    for (rotated, _), row in zip(pre, rows):
+        row_h       = max(r.height for r in rotated)
+        total_img_w = sum(r.width for r in rotated)
+        n_imgs      = len(rotated)
+        total_gaps  = canvas_width_px - total_img_w
+        inter_gap   = total_gaps // (n_imgs + 1)  # equal left/right/between margins
 
-    y = padding
-    for (row_h, angles, rotated), orig_row in zip(row_heights, rows):
-        # Scale rotated images so they fit row height nicely
-        usable_w = canvas_width_px - 2 * padding
-        total_img_w = sum(r.width for r in rotated) + padding * (len(rotated) - 1)
-
-        # Distribute any leftover space evenly
-        leftover = usable_w - total_img_w
-        extra_pad = leftover // max(len(rotated), 1)
-
-        x = padding + extra_pad // 2
+        x = inter_gap
         for img_r in rotated:
-            # Vertical centering within the row
             cy = y + (row_h - img_r.height) // 2
-            # Paste with alpha mask (rounded corners)
             if img_r.mode == "RGBA":
                 canvas.paste(img_r, (x, cy), img_r.split()[3])
             else:
                 canvas.paste(img_r, (x, cy))
-            x += img_r.width + padding + extra_pad
+            x += img_r.width + inter_gap
 
-        y += row_h
+        y += row_h + gap
 
     return canvas
 
 
-def save_pdf(collage: Image.Image, output_path: Path, dpi: int,
-             canvas_width_cm: float) -> None:
-    """Save PIL image as PDF at the given physical size."""
-    width_pt  = canvas_width_cm * cm
+# ── Export ────────────────────────────────────────────────────────────────────
+
+def save_pdf(collage: Image.Image, output_path: Path, cfg: Config) -> None:
+    """Save the composited image as a single-page PDF at physical dimensions."""
+    width_pt  = cfg.width_cm * cm
     height_pt = collage.height / collage.width * width_pt
 
-    c = rl_canvas.Canvas(str(output_path), pagesize=(width_pt, height_pt))
-    # Save image to a temp file for reportlab
+    c   = rl_canvas.Canvas(str(output_path), pagesize=(width_pt, height_pt))
     tmp = output_path.with_suffix(".tmp.png")
     collage.save(tmp, "PNG")
-    c.drawImage(str(tmp), 0, 0, width=width_pt, height=height_pt)
+    c.drawImage(str(tmp), 0, 0, width=width_pt, height=height_pt,
+                mask="auto" if cfg.transparent_background else None)
     c.save()
     tmp.unlink(missing_ok=True)
-    print(f"✓ Saved → {output_path}  ({canvas_width_cm}cm × "
-          f"{height_pt / cm:.1f}cm  |  {collage.width}×{collage.height}px)")
+
+    print(f"✓  {output_path}  "
+          f"({cfg.width_cm}cm × {height_pt / cm:.1f}cm  |  "
+          f"{collage.width}×{collage.height}px)")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Playful photo collage → PDF")
-    parser.add_argument("folder", help="Folder containing source images")
-    parser.add_argument("output", nargs="?", default="collage.pdf",
-                        help="Output PDF path (default: collage.pdf)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Random seed for reproducible layout")
-    parser.add_argument("--dpi", type=int, default=DPI_DEFAULT,
-                        help=f"Render DPI (default: {DPI_DEFAULT})")
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Playful photo collage → PDF",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("folder",  help="Folder containing source images")
+    parser.add_argument("output",  nargs="?", default="collage.pdf",
+                        help="Output PDF path")
+    parser.add_argument("--config", type=Path, default=DEFAULT_INI,
+                        help="Path to collage.ini config file")
+    parser.add_argument("--seed",  type=int, default=None,
+                        help="RNG seed for reproducible layout")
     args = parser.parse_args()
 
-    rng = random.Random(args.seed)
+    cfg    = load_config(args.config)
+    rng    = random.Random(args.seed)
     folder = Path(args.folder)
+
     if not folder.is_dir():
         sys.exit(f"Not a directory: {folder}")
 
-    canvas_w_px = px(CANVAS_WIDTH_CM, args.dpi)
-    padding_px  = PADDING_PX
+    canvas_w_px = px(cfg.width_cm, cfg.dpi)
 
-    print(f"📂 Loading images from {folder} …")
-    images = load_images(folder, args.dpi, canvas_w_px)
+    print(f"📂  Loading images from {folder} …")
+    images = load_images(folder, cfg, canvas_w_px)
     rng.shuffle(images)
-    print(f"   {len(images)} images loaded")
+    print(f"    {len(images)} images  |  "
+          f"rows: {cfg.min_images_per_row}–{cfg.max_images_per_row} imgs/row  |  "
+          f"rotation ±{cfg.rotation_max_deg}°  |  "
+          f"corners r={cfg.corner_radius_px}px")
 
-    print("🗂  Arranging rows …")
-    rows = arrange_rows(images, canvas_w_px, padding_px)
-    print(f"   {len(rows)} rows")
+    print("🗂   Arranging rows …")
+    rows = arrange_rows(images, canvas_w_px, cfg)
+    print(f"    {len(rows)} rows")
 
-    print("🎨 Compositing collage …")
-    collage = build_canvas(rows, canvas_w_px, padding_px, rng)
+    print("🎨  Compositing …")
+    collage = build_canvas(rows, canvas_w_px, cfg, rng)
 
-    output_path = Path(args.output)
-    print("📄 Saving PDF …")
-    save_pdf(collage, output_path, args.dpi, CANVAS_WIDTH_CM)
+    print("📄  Saving PDF …")
+    save_pdf(collage, Path(args.output), cfg)
 
 
 if __name__ == "__main__":
