@@ -1,0 +1,15 @@
+{
+  "brightness":  -10,
+  "contrast":    1.05,
+  "saturation":  1.10,
+  "hue_shift":   5,
+  "shadows":     8,
+  "midtones":    0,
+  "highlights":  -5,
+  "r_offset":    -5,
+  "g_offset":    4,
+  "b_offset":    10,
+  "r_gain":      1.0,
+  "g_gain":      1.0,
+  "b_gain":      0.97
+}
