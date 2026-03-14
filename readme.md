@@ -13,6 +13,6 @@ cd /Users/pavel/GIT/GitHub/collage_maker_2026 ; chmod +x *.py
 
 #saving manifest(file names order) to 
 export WORKDIR="/Users/Shared/PE_DATA/PE_DCIM_archive"
-./collage_generator2.py "$WORKDIR/Mila_POSTER-WA_EXPORT_SEL1/MAX_1600" "$WORKDIR/collage_no_numbers_v05.pdf" --seed 42 --save-manifest --label-files
+./collage_generator2.py "$WORKDIR/Mila_POSTER-WA_EXPORT_SEL1/MAX_1600" "$WORKDIR/collage_no_numbers_v05.pdf" --seed -1 --save-manifest --label-files
 #using manifest
 ./collage_generator.py "$WORKDIR/Mila_POSTER-WA_EXPORT_SEL1/MAX_1600" "$WORKDIR/collage_no_numbers_v05.pdf" --order manifest --label-files
