@@ -1,8 +1,13 @@
 
 A straightforward, deterministic correction tool is exactly the right approach.**CLI:**
 ```bash
-pip3 install Pillow numpy
-python3 adjust_image.py --input photo.jpg --output photo_print.png --profile corrections.json [--debug]
+pip3 install Pillow numpy pymupdf
+python3 adjust_image.py \
+    --input   <file>         # JPG, PNG, TIFF or PDF
+    --output  <file>         # output path (same or different format)
+    --profile <file.json>    # correction profile
+    [--debug]                # append annotation strip
+    [--dpi    <int>]         # PDF rasterisation DPI (default: 300)
 ```
 
 **Profile keys** (all optional — omit any key to leave it at its neutral value):
